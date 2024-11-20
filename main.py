@@ -6,7 +6,14 @@ import tensorflow as tf
 from keras import layers, models
 import random
 import pickle
+from functools import cmp_to_key
+from tensorflow.keras.backend import clear_session
 
+# Some symbols had to be filtered out since they were not well documented, conflicted with other symbols, or were beyond the scope of this project
+# Symbols include: , | [ ] alpha ...
+
+# A mapping between the default folder names and the corresponding latex syntax
+# Not all of these were used, since the dataset was pruned
 folder_to_latex = {
     '!': '!',
     '(': '\\left(',
@@ -92,18 +99,9 @@ folder_to_latex = {
     '}': '\\right\\}',
 }
 
-def load_data(data_dir, images_per_class=500, random_state=None):
-    """
-    Loads and preprocesses images from the dataset directory.
-
-    Args:
-        data_dir (str): Path to the data directory.
-
-    Returns:
-        images (np.ndarray): Array of image data.
-        labels (np.ndarray): Array of labels corresponding to images.
-        label_map (dict): Mapping from label indices to LaTeX commands.
-    """
+# Loads and preprocesses images from the given dataset directory
+# Returns the resized images, labels, and label_map
+def load_data(data_dir, images_per_class, random_state=None):
     images = []
     labels = []
     label_map = {}
@@ -154,7 +152,7 @@ else:
     print("Processed data not found. Loading and processing images...")
     images, labels, label_map = load_data(
         data_dir,
-        images_per_class=500,
+        images_per_class=5000,
         random_state=42
     )
     np.savez(data_npz_path, images=images, labels=labels)
@@ -165,3 +163,154 @@ else:
 print("\nLabel Map:")
 for key, value in label_map.items():
     print(f"{key}: {value}")
+
+X_train, X_val, y_train, y_val = train_test_split(
+    images, labels, test_size=0.2, random_state=42)
+
+num_classes = len(label_map)
+print(f"\nNumber of classes: {num_classes}")
+
+
+model_keras_path = "character_recognizer.keras"
+
+# We want to check if the model has been saved before training a new one
+if os.path.exists(model_keras_path):
+    print("Loading trained model...")
+    model = models.load_model(model_keras_path)
+    print("Model loaded successfully")
+else:
+    # We used a Convolutional Neural Network here which is good for character recognition
+    model = models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),
+        layers.MaxPooling2D((2, 2)),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.MaxPooling2D((2, 2)),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        # layers.Dropout(0.5),     # We experimented here with dropout layers which are supposed to help with overfitting, but more data helped as well
+        layers.Dense(num_classes, activation='softmax')
+    ])
+
+
+    model.compile(optimizer='adam',
+                 loss='sparse_categorical_crossentropy',
+                 metrics=['accuracy'])
+
+    print("\nStarting model training...")
+    history = model.fit(X_train, y_train, epochs=15, 
+                       validation_data=(X_val, y_val))
+
+    model.save(model_keras_path)
+    print(f"\nModel saved as '{model_keras_path}'")
+    clear_session()
+
+
+
+# Function to segment the expression image into individual characters
+# Basically for this function we want to identify the different characters in an equation and the sort them from left to right, alongside their bounding boxes
+def segment_expression(image):
+    thresh = cv2.adaptiveThreshold(
+        image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2)
+    
+    kernel = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    contours, _ = cv2.findContours(
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bounding_boxes = [cv2.boundingRect(c) for c in contours]
+    bounding_boxes = sorted(bounding_boxes, key=lambda b: b[0])
+    char_images = []
+
+    for bbox in bounding_boxes:
+        x, y, w, h = bbox
+        char_img = image[y:y+h, x:x+w]
+        char_img = resize_and_pad(char_img, size=28)
+        char_img = char_img / 255.0
+        char_images.append(char_img)
+    return char_images
+
+# After segmenting the images, it is helpful to resize the images to the size of the training images by padding the borders with white pixels
+def resize_and_pad(image, size=28):
+    h, w = image.shape
+    scaling_factor = size / max(h, w)
+    new_w = int(w * scaling_factor)
+    new_h = int(h * scaling_factor)
+    resized_image = cv2.resize(image, (new_w, new_h))
+    pad_w = size - new_w
+    pad_h = size - new_h
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    padded_image = cv2.copyMakeBorder(
+        resized_image, top, bottom, left, right,
+        cv2.BORDER_CONSTANT, value=255)  # Pad with white pixels
+    return padded_image
+
+# Same idea as the segmentation function above but it also draws bounding boxes to help with visualization
+def segment_expression_with_visualization(image):
+    
+    imgGray = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    
+    imgCanny = cv2.Canny(imgGray, 50,180)
+    kernel = np.ones((5,5), np.uint8)
+    imgDilated = cv2.dilate(imgCanny, kernel, iterations=2)
+
+    contours, _= cv2.findContours(imgDilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    
+    filtered_contours = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        aspect_ratio = w / float(h)
+        min_area = 20
+        max_area = 10000
+        is_possible_equals = aspect_ratio > 1.5 and w > 10
+        
+        if (min_area < area < max_area) or is_possible_equals:
+            filtered_contours.append(contour)
+    
+    bounding_boxes = [cv2.boundingRect(c) for c in filtered_contours]
+    bounding_boxes = sorted(bounding_boxes, key=lambda b: b[0])
+    
+    char_images = []
+    for bbox in bounding_boxes:
+        x, y, w, h = bbox
+        aspect_ratio = w / float(h)
+        color = (0, 255, 0)
+        cv2.rectangle(imgGray, (x, y), (x + w, y + h), color, 2)
+        
+        char_img = image[y:y+h, x:x+w]
+        char_img = resize_and_pad(char_img, size=28)
+        char_img = char_img / 255.0
+        char_images.append(char_img)
+
+    cv2.imshow('Segmented Characters', imgGray)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    
+    return char_images
+
+
+expression_image = cv2.imread('test_img8.jpg', cv2.IMREAD_GRAYSCALE)
+
+if expression_image is None:
+    print("Error: Expression image not found.")
+else:
+    char_images = segment_expression_with_visualization(expression_image)
+    char_images_array = np.array(char_images).reshape(-1, 28, 28, 1)
+
+    # Load the trained model
+    predictions = model.predict(char_images_array)
+    predicted_labels = np.argmax(predictions, axis=1)
+    predicted_sequence = [label_map[label] for label in predicted_labels]
+
+    def sequence_to_latex(sequence):
+
+        latex_code = ''.join(sequence)
+        return latex_code
+
+    latex_output = sequence_to_latex(predicted_sequence)
+    print("\nPredicted LaTeX Code:")
+    print(latex_output)
